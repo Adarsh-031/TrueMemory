@@ -256,6 +256,13 @@ Proactive search — BEFORE saying "I don't have":
 - Common examples: API keys (OpenRouter, Anthropic, PyPI, GitHub tokens), SSH credentials and IP addresses, database passwords, service URLs, project configuration details.
 - If TrueMemory has the information, use it directly. Only say "I don't have X" after searching and confirming it's not stored.
 
+Directives (truememory_store with directive=True, truememory_directives):
+- Directives are always-loaded user instructions that shape every session (e.g. "Never put my real name in code repos", "Always load my SSH keys at session start").
+- When the user says "save this as a directive", "always do X", "never do Y", or similar standing instructions, store with directive=True: truememory_store(content="...", directive=True).
+- Directives are automatically injected at the start of every session before search-ranked memories — they do not need to be searched for.
+- Use truememory_directives to list all active directives for a user.
+- Regular facts and preferences should NOT be stored as directives — only standing instructions that should override defaults in every session.
+
 You should store and recall memories as naturally as a good assistant who remembers past conversations. Do not ask permission to remember things — just do it.""",
 )
 
@@ -630,6 +637,8 @@ def truememory_store(
         content: The fact or preference to remember. Write as a clear, atomic statement.
         user_id: Owner of this memory (e.g. a person's name).
         metadata: Optional JSON string of metadata.
+        directive: Set True for standing instructions that should load every session
+                   (e.g. "Never put my real name in repos"). Regular facts stay False.
     """
     _touch_search_time()
     # Reject None / empty / whitespace-only content with an explicit error
