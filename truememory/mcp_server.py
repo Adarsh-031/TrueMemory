@@ -212,6 +212,11 @@ mcp = FastMCP(
     "truememory",
     instructions="""You have access to a persistent memory system (TrueMemory). Use it proactively.
 
+CRITICAL — LOADING TRUEMEMORY TOOLS:
+TrueMemory tools may be DEFERRED (schemas not loaded at startup). Before calling any truememory tool, you MUST first load the schemas via ToolSearch:
+  ToolSearch(query="select:mcp__truememory__truememory_search,mcp__truememory__truememory_store,mcp__truememory__truememory_stats")
+Do this at the START of every conversation, before any other work. If you skip this step, tool calls will fail with InputValidationError.
+
 IMPORTANT — MEMORY PRECEDENCE:
 TrueMemory is the PRIMARY long-horizon memory for this user. It persists facts, preferences, decisions, and corrections across sessions, projects, and machines. Claude Code's built-in auto-memory (MEMORY.md files) is for session-specific working notes only — NOT for user facts.
 On ANY question about the user ("what does the user like", "do you remember…", "what's my favorite…"), search TrueMemory FIRST, ALWAYS, before answering "I don't know." Do NOT store user facts to the built-in auto-memory — those go to TrueMemory only.
