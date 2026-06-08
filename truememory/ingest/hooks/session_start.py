@@ -431,11 +431,11 @@ def _first_run_context() -> str:
     return "\n".join(lines)
 
 
-def _load_preferences(memory, user_id: str = "") -> list[dict]:
-    """Load all preference memories unconditionally."""
+def _load_directives(memory, user_id: str = "") -> list[dict]:
+    """Load all directive memories unconditionally."""
     try:
         memory._engine._ensure_connection()
-        query = "SELECT id, content, sender, timestamp, category FROM messages WHERE preference = 1"
+        query = "SELECT id, content, sender, timestamp, category FROM messages WHERE directive = 1"
         params: list = []
         if user_id:
             query += " AND sender = ?"
@@ -457,25 +457,25 @@ def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> s
     db = db_path or None
     memory = Memory(path=db) if db else Memory()
 
-    # Load preferences first — these are always injected
-    prefs = _load_preferences(memory, user_id=user_id)
-    pref_ids = {p["id"] for p in prefs}
+    # Load directives first — these are always injected
+    directives = _load_directives(memory, user_id=user_id)
+    directive_ids = {d["id"] for d in directives}
 
     parts = []
 
-    if prefs:
-        pref_lines = [
-            "<truememory-preferences>",
-            "## User Preferences (always loaded)",
+    if directives:
+        dir_lines = [
+            "<truememory-directives>",
+            "## User Directives (always loaded)",
             "These directives override defaults and apply to every session:",
             "",
         ]
-        for p in prefs:
-            content = p.get("content", "").strip()
+        for d in directives:
+            content = d.get("content", "").strip()
             if content:
-                pref_lines.append(f"- {content}")
-        pref_lines.append("</truememory-preferences>")
-        parts.append("\n".join(pref_lines))
+                dir_lines.append(f"- {content}")
+        dir_lines.append("</truememory-directives>")
+        parts.append("\n".join(dir_lines))
 
     queries = [
         "user preferences favorites likes dislikes",
@@ -488,7 +488,7 @@ def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> s
     per_query_limit = max(1, MEMORY_LIMIT // len(queries))
 
     all_results = []
-    seen_ids = set(pref_ids)
+    seen_ids = set(directive_ids)
     seen_content = set()
 
     for query in queries:

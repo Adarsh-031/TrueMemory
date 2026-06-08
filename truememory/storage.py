@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS messages (
     episode_id INTEGER DEFAULT NULL,
     emotional_valence REAL DEFAULT 0.0,
     embedding_separation BLOB DEFAULT NULL,
-    preference INTEGER DEFAULT 0
+    directive INTEGER DEFAULT 0
 );
 
 -- FTS5 virtual table for full-text search
@@ -256,7 +256,7 @@ _EXPECTED_COLUMNS = {
     "episode_id": "INTEGER DEFAULT NULL",
     "emotional_valence": "REAL DEFAULT 0.0",
     "embedding_separation": "BLOB DEFAULT NULL",
-    "preference": "INTEGER DEFAULT 0",
+    "directive": "INTEGER DEFAULT 0",
 }
 
 
@@ -606,7 +606,7 @@ def insert_message(conn: sqlite3.Connection, msg: dict) -> int:
         raise ValueError("content cannot be empty or whitespace-only")
     cursor = conn.execute(
         """INSERT INTO messages
-           (content, sender, recipient, timestamp, category, modality, preference)
+           (content, sender, recipient, timestamp, category, modality, directive)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (
             msg["content"],
@@ -615,7 +615,7 @@ def insert_message(conn: sqlite3.Connection, msg: dict) -> int:
             msg.get("timestamp", ""),
             msg.get("category", ""),
             msg.get("modality", ""),
-            1 if msg.get("preference") else 0,
+            1 if msg.get("directive") else 0,
         ),
     )
     return cursor.lastrowid

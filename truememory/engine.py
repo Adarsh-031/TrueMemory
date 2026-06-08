@@ -568,7 +568,7 @@ class TrueMemoryEngine:
         timestamp: str = "",
         category: str = "",
         metadata: dict | None = None,
-        preference: bool = False,
+        directive: bool = False,
     ) -> dict:
         """Store a single memory.
 
@@ -621,7 +621,7 @@ class TrueMemoryEngine:
                 "timestamp": timestamp,
                 "category": category,
                 "modality": "",
-                "preference": preference,
+                "directive": directive,
             }
             new_id = insert_message(self.conn, msg)
 

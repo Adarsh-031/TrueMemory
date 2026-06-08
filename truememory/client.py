@@ -63,7 +63,7 @@ class Memory:
         content: str,
         user_id: str | None = None,
         metadata: dict | None = None,
-        preference: bool = False,
+        directive: bool = False,
     ) -> dict:
         """Store a memory.
 
@@ -103,7 +103,7 @@ class Memory:
             content=content,
             sender=user_id or "",
             timestamp=now,
-            preference=preference,
+            directive=directive,
         )
         result["user_id"] = user_id or ""
         result["created_at"] = now
