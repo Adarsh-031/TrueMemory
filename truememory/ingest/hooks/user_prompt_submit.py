@@ -132,8 +132,16 @@ def _detect_recall(prompt: str) -> bool:
     return bool(_RECALL_RE.search(prompt))
 
 
-def _try_auto_recall(prompt: str, user_id: str, db_path: str) -> str | None:
-    """Search TrueMemory if prompt looks like a recall question."""
+def _try_auto_recall(prompt: str, user_id: str, db_path: str, session_id: str = "") -> str | None:
+    """Search TrueMemory if prompt looks like a recall question.
+
+    Skips the search entirely on the first prompt right after SessionStart,
+    which already injected recall (issue #561). The gate runs before detection
+    and the Memory load so the redundant first-message recall costs nothing.
+    """
+    from truememory.ingest.hooks._shared import consume_recall_injected
+    if session_id and consume_recall_injected(session_id):
+        return None
     if not _detect_recall(prompt):
         return None
     try:
@@ -250,7 +258,7 @@ def main():
         except Exception:
             pass
 
-    recall_context = _try_auto_recall(prompt, args.user, args.db)
+    recall_context = _try_auto_recall(prompt, args.user, args.db, session_id)
     if recall_context:
         print(json.dumps({"additionalContext": recall_context}))
 

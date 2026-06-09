@@ -402,6 +402,12 @@ def main():
             context = _first_run_context()
         else:
             context = recall_memories(input_data, user_id=args.user, db_path=args.db)
+            '''Mark recall as injected so the first UserPromptSubmit can skip
+            its redundant per-message auto-recall (issue #561).'''
+            session_id = input_data.get("session_id", "")
+            if session_id:
+                from truememory.ingest.hooks._shared import mark_recall_injected
+                mark_recall_injected(session_id)
 
         # Check for available updates
         update_notice = _check_for_update()
