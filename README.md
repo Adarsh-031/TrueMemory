@@ -66,6 +66,8 @@
 >
 > **With TrueMemory:** Your agent already knows you use FastAPI, prefer Pydantic v2, and that your auth middleware lives in `src/auth/`. It remembers your corrections, your preferences, and your decisions. Across every session, forever.
 
+<p align="center"><a href="https://discord.gg/ZJ74JB2gVW"><strong>Join the Discord</strong></a> to see what others are building with TrueMemory.</p>
+
 ---
 
 ## How TrueMemory Compares
@@ -108,7 +110,7 @@ irm https://raw.githubusercontent.com/buildingjoshbetter/TrueMemory/main/install
 
 </details>
 
-That's it. TrueMemory remembers your conversations automatically from here.
+That's it. TrueMemory remembers your conversations automatically from here. Need help? [Join our Discord](https://discord.gg/ZJ74JB2gVW).
 
 ### For developers (Python library)
 
@@ -258,7 +260,7 @@ Anonymous usage telemetry (tool calls, session counts, platform info) is on by d
 pip install truememory
 ```
 
-Questions? [Open a Discussion](https://github.com/buildingjoshbetter/TrueMemory/discussions). If TrueMemory saves you time, [give us a ⭐](https://github.com/buildingjoshbetter/TrueMemory)
+Questions? [Join our Discord](https://discord.gg/ZJ74JB2gVW) or [open a Discussion](https://github.com/buildingjoshbetter/TrueMemory/discussions). If TrueMemory saves you time, [give us a ⭐](https://github.com/buildingjoshbetter/TrueMemory)
 
 ---
 
