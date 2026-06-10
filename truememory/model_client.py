@@ -48,6 +48,24 @@ _MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 _SERVER_START_TIMEOUT = 30.0
 _REQUEST_TIMEOUT = 120.0
 
+# Issue #577: process-wide deadline override for model-server requests.
+# None keeps the legacy 120s default. Latency-sensitive processes (Claude
+# Code hooks) set a short deadline via set_request_timeout() so a contended
+# server fast-fails and the caller's FTS-only fallback can trigger.
+_default_request_timeout: float | None = None
+
+
+def set_request_timeout(timeout: float | None) -> None:
+    """Set a process-wide deadline (seconds) for model-server requests.
+
+    When set, every request issued by this process without an explicit
+    per-call ``timeout=`` fast-fails with :class:`TimeoutError` once the
+    deadline expires, instead of absorbing the full autostart + retry
+    cycle. Pass ``None`` to restore the legacy 120s behavior.
+    """
+    global _default_request_timeout
+    _default_request_timeout = timeout
+
 
 def _json_object_hook(obj):
     """Decode base64-encoded numpy arrays from JSON."""
@@ -182,8 +200,15 @@ def _server_ready() -> bool:
     return PORT_PATH.exists() and TOKEN_PATH.exists()
 
 
-def _start_server() -> bool:
-    """Start the model server as a detached subprocess."""
+def _start_server(wait_timeout: float | None = None) -> bool:
+    """Start the model server as a detached subprocess.
+
+    *wait_timeout* caps how long to wait for the spawned server to become
+    ready (defaults to ``_SERVER_START_TIMEOUT``). Deadline-bound callers
+    (issue #577) pass their remaining budget: the spawn still happens, so
+    the server warms up for subsequent requests even when this call
+    returns False.
+    """
     if os.environ.get("TRUEMEMORY_NO_MODEL_SERVER", "") == "1":
         return False
     _TRUEMEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -242,22 +267,26 @@ def _start_server() -> bool:
         else:
             return False
 
-    deadline = time.time() + _SERVER_START_TIMEOUT
+    wait = _SERVER_START_TIMEOUT
+    if wait_timeout is not None:
+        wait = min(wait, max(wait_timeout, 0.0))
+    deadline = time.time() + wait
     while time.time() < deadline:
         if _server_ready():
             time.sleep(0.2)
             return True
         time.sleep(0.1)
 
-    log.warning("Model server did not start within %.0fs", _SERVER_START_TIMEOUT)
+    log.warning("Model server did not start within %.0fs", wait)
     return False
 
 
-def _connect() -> socket.socket:
+def _connect(timeout: float | None = None) -> socket.socket:
     """Open a connection to the model server (Unix or TCP)."""
+    request_timeout = _REQUEST_TIMEOUT if timeout is None else timeout
     if _USE_UNIX:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(_REQUEST_TIMEOUT)
+        sock.settimeout(request_timeout)
         try:
             sock.connect(str(SOCK_PATH))
         except OSError:
@@ -274,7 +303,7 @@ def _connect() -> socket.socket:
         raise ConnectionError("Model server token file not found")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(_REQUEST_TIMEOUT)
+    sock.settimeout(request_timeout)
     try:
         sock.connect((_LOOPBACK_HOST, port))
         sock.sendall(token)
@@ -284,9 +313,9 @@ def _connect() -> socket.socket:
     return sock
 
 
-def _send_request(request: dict) -> dict:
+def _send_request(request: dict, timeout: float | None = None) -> dict:
     """Send a request to the model server and return the response."""
-    sock = _connect()
+    sock = _connect(timeout)
     try:
         data = json.dumps(request).encode("utf-8")
         header = struct.pack(_HEADER_FMT, len(data))
@@ -316,15 +345,54 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     return bytes(buf)
 
 
-def _request_with_autostart(request: dict) -> dict:
-    """Send request, auto-starting server if needed."""
+def _deadline_error(timeout: float) -> TimeoutError:
+    return TimeoutError(
+        f"Model server request exceeded {timeout:.1f}s deadline"
+    )
+
+
+def _request_with_autostart(request: dict, timeout: float | None = None) -> dict:
+    """Send request, auto-starting server if needed.
+
+    *timeout* is a per-request deadline in seconds; ``None`` uses the
+    process default (see :func:`set_request_timeout`, issue #577) which in
+    turn defaults to the legacy ``_REQUEST_TIMEOUT``. When a deadline is in
+    effect, expiry raises :class:`TimeoutError` immediately (fast-fail)
+    instead of silently absorbing the autostart + full-timeout retry cycle —
+    deadline-bound callers (hook recall) have their own FTS-only fallback.
+    """
+    if timeout is None:
+        timeout = _default_request_timeout
+    has_deadline = timeout is not None
+    started = time.monotonic()
+
     try:
-        return _send_request(request)
-    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
+        return _send_request(request, timeout=timeout)
+    except TimeoutError:
+        # socket.timeout is TimeoutError on Python >= 3.10.
+        if has_deadline:
+            raise _deadline_error(timeout) from None
+        # Legacy path (no deadline): fall through to autostart + retry.
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
         pass
 
-    if not _start_server():
+    remaining: float | None = None
+    if has_deadline:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise _deadline_error(timeout)
+
+    if not _start_server(wait_timeout=remaining):
         raise ConnectionError("Cannot start model server")
+
+    if has_deadline:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise _deadline_error(timeout)
+        try:
+            return _send_request(request, timeout=remaining)
+        except TimeoutError:
+            raise _deadline_error(timeout) from None
 
     return _send_request(request)
 
@@ -335,14 +403,20 @@ class EmbeddingProxy:
     def __init__(self, tier: str = ""):
         self._tier = tier
 
-    def encode(self, texts, **kwargs) -> np.ndarray:
+    def encode(self, texts, timeout: float | None = None, **kwargs) -> np.ndarray:
+        """Embed *texts* via the model server.
+
+        *timeout* is an optional per-call deadline in seconds (issue #577);
+        on expiry a :class:`TimeoutError` is raised (fast-fail, no autostart
+        retry). ``None`` uses the process default / legacy 120s.
+        """
         if isinstance(texts, str):
             texts = [texts]
         resp = _request_with_autostart({
             "op": "embed",
             "texts": list(texts),
             "tier": self._tier,
-        })
+        }, timeout=timeout)
         if not resp.get("ok"):
             raise RuntimeError(f"Model server error: {resp.get('error', 'unknown')}")
         return resp["vectors"]
@@ -354,12 +428,17 @@ class RerankerProxy:
     def __init__(self, model_name: str | None = None):
         self._model_name = model_name
 
-    def predict(self, pairs, **kwargs) -> np.ndarray:
+    def predict(self, pairs, timeout: float | None = None, **kwargs) -> np.ndarray:
+        """Rerank *pairs* via the model server.
+
+        *timeout* is an optional per-call deadline in seconds (issue #577);
+        see :meth:`EmbeddingProxy.encode`.
+        """
         resp = _request_with_autostart({
             "op": "rerank",
             "pairs": list(pairs),
             "model_name": self._model_name,
-        })
+        }, timeout=timeout)
         if not resp.get("ok"):
             raise RuntimeError(f"Model server error: {resp.get('error', 'unknown')}")
         return resp["scores"]

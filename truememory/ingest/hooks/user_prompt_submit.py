@@ -145,6 +145,15 @@ def _try_auto_recall(prompt: str, user_id: str, db_path: str, session_id: str = 
     if not _detect_recall(prompt):
         return None
     try:
+        # Issue #577: short model-server deadline so a contended server
+        # fast-fails and the search falls back to FTS-only instead of
+        # stalling this hook for up to 120s.
+        try:
+            from truememory.ingest.hooks._shared import get_recall_deadline
+            from truememory.model_client import set_request_timeout
+            set_request_timeout(get_recall_deadline())
+        except Exception:
+            pass
         from truememory.client import Memory
         m = Memory(path=db_path or None)
         results = m.search(prompt, user_id=user_id or None, limit=5)

@@ -113,18 +113,41 @@ class TestModelServerMpsRestore(unittest.TestCase):
         source = inspect.getsource(model_server)
         self.assertIn("from truememory.mps_utils import is_mps_oom", source)
 
-    def test_model_server_restores_to_mps(self):
-        """H4: After CPU fallback, model should be moved back to MPS."""
+    def test_model_server_sticky_cpu_no_mps_restore(self):
+        """H4 (superseded by #577): after CPU fallback the model must STAY
+        on CPU for the server's lifetime.
+
+        The original H4 fix restored the model to MPS after recovery, but
+        the MPS pool never drops below the watermark cap after an OOM, so
+        re-promotion guaranteed the next OOM (measured retry storms stalling
+        every client 23-112s — issue #577). The policy is now sticky-CPU
+        degradation: model.to("cpu") with NO model.to("mps") re-promotion.
+        """
         import inspect
         from truememory import model_server
-        inspect.getsource(model_server)
         handler_source = inspect.getsource(model_server.ModelServer.handle_request)
-        # After model.to("cpu") there should be model.to("mps")
-        cpu_idx = handler_source.find('model.to("cpu")')
-        mps_idx = handler_source.find('model.to("mps")')
-        self.assertGreater(cpu_idx, -1, "Should have model.to('cpu')")
-        self.assertGreater(mps_idx, -1, "Should have model.to('mps') restore")
-        self.assertGreater(mps_idx, cpu_idx, "MPS restore must come after CPU fallback")
+        recovery_source = inspect.getsource(
+            model_server.ModelServer._recover_embed_oom_locked
+        )
+        fast_source = inspect.getsource(model_server.ModelServer._handle_fast_embed)
+        # All embed OOM recovery is routed through the single helper
+        # (issue #577 panel round 2) — both the batch path and the fast lane.
+        self.assertIn("_recover_embed_oom_locked", handler_source)
+        self.assertIn("_recover_embed_oom_locked", fast_source)
+        self.assertIn('model.to("cpu")', recovery_source,
+                      "recovery must move the model to CPU")
+        self.assertIn("_mark_sticky_cpu", recovery_source,
+                      "OOM recovery must mark the model sticky-CPU (issue #577)")
+        for src_name, src in (
+            ("handle_request", handler_source),
+            ("_recover_embed_oom_locked", recovery_source),
+            ("_handle_fast_embed", fast_source),
+        ):
+            self.assertNotIn(
+                'model.to("mps")', src,
+                f"model.to('mps') re-promotion must NOT exist in {src_name} — "
+                "sticky-CPU degradation (issue #577) replaces the H4 restore",
+            )
 
 
 if __name__ == "__main__":

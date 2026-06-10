@@ -55,6 +55,7 @@ import struct  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -104,19 +105,45 @@ def _json_object_hook(obj):
 _HMAC_TOKEN_BYTES = 32
 
 
+@dataclass(frozen=True)
+class _EmbedState:
+    """Immutable snapshot of the loaded embedding model and its identity.
+
+    Issue #577 (panel round 2): the server stores this in a SINGLE attribute
+    (``ModelServer._embed_state``) assigned only while holding the global
+    request lock. Lock-free readers (the single-text fast lane) read one
+    reference — Python reference assignment is atomic, so a reader can never
+    observe a torn ``(model, tier, model_id)`` triple.
+    """
+
+    model: object
+    tier: str
+    model_id: str
+
+
 class ModelServer:
     """Serves embedding and reranking over a Unix domain socket (POSIX)
     or HMAC-authenticated TCP loopback (Windows)."""
 
     _SUSTAINED_THRESHOLD = 10
     _SUSTAINED_WINDOW = 30
+    # Requests with at most this many texts take the single-text fast lane
+    # (issue #577): hook recall queries must never queue behind ingestion
+    # batches or OOM recovery.
+    _FAST_LANE_MAX_TEXTS = 1
 
     def __init__(self):
-        self._embed_model = None
-        self._embed_tier: str | None = None
+        # Loaded embedding model + identity as ONE immutable snapshot,
+        # assigned only under self._lock; the fast lane reads the single
+        # reference lock-free (issue #577, panel round 2).
+        self._embed_state: _EmbedState | None = None
         self._reranker = None
         self._reranker_name: str | None = None
         self._lock = threading.Lock()
+        # Issue #577: idle-tracking gets its own lock so the single-text
+        # fast lane (and the idle checker) never block on the global
+        # request lock while a batch encode is in flight.
+        self._activity_lock = threading.Lock()
         self._last_activity = time.time()
         self._running = True
         self._embed_timestamps: list[float] = []
@@ -124,20 +151,74 @@ class ModelServer:
         self._throttler_active = False
         self._token: bytes | None = None  # HMAC token for TCP transport
         self._bound_port: int | None = None  # TCP port (Windows only)
+        # Issue #577: models that hit an MPS OOM are degraded to CPU for the
+        # lifetime of this server process ("embed" / "rerank"). Mutated only
+        # while holding self._lock; read lock-free (string membership).
+        self._sticky_cpu: set[str] = set()
+        # Issue #577: dedicated CPU encoder for the single-text fast lane,
+        # loaded lazily on the first *contended* single-text request.
+        # Cached by MODEL ID (not tier string) so it always tracks the main
+        # path's actual loaded identity.
+        self._fast_encoder = None
+        self._fast_model_id: str | None = None
+        self._fast_lock = threading.Lock()
 
-    def _get_embed_model(self, tier: str):
-        if self._embed_model is not None and self._embed_tier == tier:
-            return self._embed_model
+    def _mark_sticky_cpu(self, kind: str) -> bool:
+        """Permanently degrade *kind* ("embed"/"rerank") to CPU after an
+        MPS OOM (issue #577). Re-promoting to MPS after recovery guaranteed
+        the next OOM (the pool never drops below the watermark cap), so the
+        degradation is sticky for the server's lifetime.
 
-        from truememory.vector_search import EMBEDDING_MODEL, set_embedding_model
+        Caller must hold ``self._lock``. Returns True on the first marking
+        (which is logged loudly, once).
+        """
+        if kind in self._sticky_cpu:
+            return False
+        self._sticky_cpu.add(kind)
+        log.error(
+            "MPS OOM in the %s path — degrading the %s model to CPU for the "
+            "lifetime of this model server (no MPS re-promotion). Restart "
+            "the server to try MPS again, or set TRUEMEMORY_DEVICE=cpu to "
+            "make CPU permanent.",
+            kind, kind,
+        )
+        return True
 
-        if tier and tier != EMBEDDING_MODEL:
-            set_embedding_model(tier)
+    def _embed_device(self) -> str | None:
+        """Device for embed model loads: sticky-CPU > TRUEMEMORY_DEVICE >
+        framework auto-selection (None)."""
+        if "embed" in self._sticky_cpu:
+            return "cpu"
+        from truememory.mps_utils import resolve_device
+        return resolve_device(None)
+
+    def _recover_embed_oom_locked(self, model) -> None:
+        """The single recovery path for an embed MPS OOM (issue #577).
+
+        Caller MUST hold ``self._lock``. Marks the embed path sticky-CPU
+        (loud log once), flushes the MPS cache, and moves the model to CPU —
+        all atomically in the caller's lock hold. Retry placement belongs to
+        the caller: single texts re-encode inside the lock (ms-scale);
+        batches re-encode after releasing it so other clients don't starve.
+        """
+        from truememory.mps_utils import flush_mps_cache
+        self._mark_sticky_cpu("embed")
+        flush_mps_cache()
+        if hasattr(model, "to"):
+            model.to("cpu")
+
+    @staticmethod
+    def _peek_embed_model_id(tier: str) -> str:
+        """Resolve a tier name to the internal embedding model ID as a PURE
+        READ — no mutation of vector_search globals (issue #577 panel: the
+        fast lane must never call ``set_embedding_model``, which force-unloads
+        the process-local model singleton and rewrites ``EMBEDDING_MODEL`` /
+        ``_embedding_dim`` while the main path may be mid-encode)."""
+        from truememory.vector_search import EMBEDDING_MODEL, _TIER_ALIASES
 
         resolved = EMBEDDING_MODEL if not tier else tier
         # Resolve tier -> internal model ID via centralized tier_config.
         # _TIER_ALIASES is still exported by vector_search for compat.
-        from truememory.vector_search import _TIER_ALIASES
         model_id = _TIER_ALIASES.get(resolved, resolved)
 
         # Custom tier: resolve via tier_config
@@ -148,23 +229,40 @@ class ModelServer:
             except (ValueError, ImportError) as e:
                 log.warning("Custom tier resolution failed (%s); falling back to model2vec.", e)
                 model_id = "model2vec"
+        return model_id
 
+    @staticmethod
+    def _resolve_embed_model_id(tier: str) -> str:
+        """Resolve a tier name to the internal embedding model ID, keeping
+        vector_search's globals in sync (main-path behavior, pre-#577)."""
+        from truememory.vector_search import EMBEDDING_MODEL, set_embedding_model
+
+        if tier and tier != EMBEDDING_MODEL:
+            set_embedding_model(tier)
+
+        return ModelServer._peek_embed_model_id(tier)
+
+    @staticmethod
+    def _build_embed_model(model_id: str, device: str | None):
+        """Construct an embedding model. ``device=None`` lets the framework
+        pick (SentenceTransformer auto-selects; model2vec is CPU-only)."""
         if model_id == "model2vec":
             from model2vec import StaticModel
-            self._embed_model = StaticModel.from_pretrained(
+            return StaticModel.from_pretrained(
                 "minishlab/potion-base-8M", force_download=False
             )
-        elif model_id == "qwen3_256":
+        if model_id == "qwen3_256":
             from sentence_transformers import SentenceTransformer
             mkwargs = {}
             if sys.platform == "darwin":
                 mkwargs["attn_implementation"] = "eager"
-            self._embed_model = SentenceTransformer(
+            return SentenceTransformer(
                 "Qwen/Qwen3-Embedding-0.6B",
                 truncate_dim=256,
                 model_kwargs=mkwargs or None,
+                device=device,
             )
-        elif model_id not in ("model2vec", "minilm", "bge-small", "qwen3_256"):
+        if model_id not in ("model2vec", "minilm", "bge-small", "qwen3_256"):
             # Custom model: require explicit opt-in for arbitrary downloads
             if os.environ.get("TRUEMEMORY_CUSTOM_ALLOW_DOWNLOAD", "").strip() != "1":
                 log.warning(
@@ -174,27 +272,79 @@ class ModelServer:
                     model_id,
                 )
                 from model2vec import StaticModel
-                self._embed_model = StaticModel.from_pretrained(
+                return StaticModel.from_pretrained(
                     "minishlab/potion-base-8M", force_download=False
                 )
-            else:
-                from sentence_transformers import SentenceTransformer
-                from truememory.tier_config import resolve_custom_tier
-                cfg = resolve_custom_tier()
-                custom_dim = cfg["embed_dim"]
-                self._embed_model = SentenceTransformer(
-                    model_id, truncate_dim=custom_dim,
-                    trust_remote_code=False,
-                )
-        else:
-            from model2vec import StaticModel
-            self._embed_model = StaticModel.from_pretrained(
-                "minishlab/potion-base-8M", force_download=False
+            from sentence_transformers import SentenceTransformer
+            from truememory.tier_config import resolve_custom_tier
+            cfg = resolve_custom_tier()
+            custom_dim = cfg["embed_dim"]
+            return SentenceTransformer(
+                model_id, truncate_dim=custom_dim,
+                trust_remote_code=False,
+                device=device,
             )
+        from model2vec import StaticModel
+        return StaticModel.from_pretrained(
+            "minishlab/potion-base-8M", force_download=False
+        )
 
-        self._embed_tier = tier
-        log.info("Loaded embedding model for tier=%s", tier)
-        return self._embed_model
+    # Model IDs the fast lane may rebuild with guaranteed vector-space
+    # parity: ONLY ids with an explicit, deterministic branch in
+    # _build_embed_model (fixed dim, no config reads). "minilm"/"bge-small"
+    # have NO explicit server branch (legacy fall-through to model2vec), and
+    # custom models re-read config.json at build time — the fast lane
+    # declines all of those and falls through to the main path.
+    _FAST_LANE_SAFE_MODEL_IDS = frozenset({"model2vec", "qwen3_256"})
+
+    def _get_embed_model(self, tier: str):
+        state = self._embed_state
+        if state is not None and state.tier == tier:
+            return state.model
+
+        model_id = self._resolve_embed_model_id(tier)
+        model = self._build_embed_model(model_id, self._embed_device())
+        # ONE atomic reference assignment of an immutable snapshot — the
+        # fast lane can never observe a torn (model, tier, model_id) triple.
+        self._embed_state = _EmbedState(model=model, tier=tier, model_id=model_id)
+        log.info("Loaded embedding model for tier=%s (model=%s)", tier, model_id)
+        return model
+
+    def _get_fast_encoder(self, tier: str):
+        """CPU-resident encoder for the single-text fast lane (issue #577).
+
+        Loaded lazily on the first single-text request that finds the global
+        lock busy, then kept for the server's lifetime. Caller must hold
+        ``self._fast_lock``.
+
+        Vector-space parity (panel rounds 1-2): the fast encoder is ONLY
+        ever built from the main path's actual loaded identity, taken from
+        one atomic read of the ``_embed_state`` snapshot. The fast lane
+        never resolves tiers itself — no global reads, no config reads, no
+        drift. Returns ``None`` (decline → caller falls through to the main
+        locked path) when there is no snapshot for this tier yet, or the
+        loaded model has no explicit deterministic builder branch.
+        """
+        state = self._embed_state  # single atomic reference read
+        if state is None or state.tier != tier:
+            # No main model loaded for this tier yet — declining means the
+            # one-time load happens exactly once, on the main path, with
+            # its usual global sync.
+            return None
+
+        if state.model_id not in self._FAST_LANE_SAFE_MODEL_IDS:
+            return None
+
+        if self._fast_encoder is not None and self._fast_model_id == state.model_id:
+            return self._fast_encoder
+
+        self._fast_encoder = self._build_embed_model(state.model_id, "cpu")
+        self._fast_model_id = state.model_id
+        log.info(
+            "Fast-lane CPU encoder loaded (tier=%s, model=%s) — single-text "
+            "requests no longer queue behind batch work", tier, state.model_id,
+        )
+        return self._fast_encoder
 
     def _get_reranker(self, model_name: str | None = None):
         from truememory.reranker import get_current_reranker_name
@@ -204,23 +354,66 @@ class ModelServer:
             return self._reranker
 
         from sentence_transformers import CrossEncoder
-        device = "cpu"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                device = "cuda:0"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-        except ImportError:
-            pass
+        from truememory.mps_utils import auto_detect_device, resolve_device
+        if "rerank" in self._sticky_cpu:
+            device = "cpu"
+        else:
+            device = resolve_device(auto_detect_device())
 
         self._reranker = CrossEncoder(name, device=device)
         self._reranker_name = name
         log.info("Loaded reranker model=%s device=%s", name, device)
         return self._reranker
 
+    def _handle_fast_embed(self, texts: list, tier: str) -> dict | None:
+        """Single-text fast lane (issue #577).
+
+        Tries the main path without blocking; when the global lock is busy
+        (a batch encode or OOM recovery is in progress) the text is encoded
+        on a dedicated CPU encoder OUTSIDE the global lock, so hook recall
+        queries never wait on ingestion work. Fast-lane requests skip the
+        sustained-workload bookkeeping entirely — a burst of small hook
+        queries must not trip the throttler's batch=1 ramp (finding C-7).
+
+        Returns a response dict, or None to fall through to the normal
+        (locked) path.
+        """
+        if self._lock.acquire(blocking=False):
+            try:
+                model = self._get_embed_model(tier)
+                try:
+                    vectors = model.encode(texts, show_progress_bar=False)
+                except RuntimeError as exc:
+                    from truememory.mps_utils import is_mps_oom
+                    if not is_mps_oom(exc):
+                        raise
+                    # Same recovery path as the batch handler, atomic in
+                    # this lock hold; a single text on CPU is ms-scale, so
+                    # the retry stays under the lock too.
+                    self._recover_embed_oom_locked(model)
+                    vectors = model.encode(texts, show_progress_bar=False)
+                return {"ok": True, "vectors": np.asarray(vectors, dtype=np.float32)}
+            finally:
+                self._lock.release()
+
+        try:
+            with self._fast_lock:
+                model = self._get_fast_encoder(tier)
+                if model is None:
+                    # Vector-space parity with the main path cannot be
+                    # guaranteed (custom model) — decline the fast lane.
+                    return None
+                vectors = model.encode(texts, show_progress_bar=False)
+            return {"ok": True, "vectors": np.asarray(vectors, dtype=np.float32)}
+        except Exception:
+            log.warning(
+                "Fast-lane CPU encode failed — falling back to the main "
+                "embed path", exc_info=True,
+            )
+            return None
+
     def handle_request(self, request: dict) -> dict:
-        with self._lock:
+        with self._activity_lock:
             self._last_activity = time.time()
         op = request.get("op")
 
@@ -230,6 +423,13 @@ class ModelServer:
         if op == "embed":
             texts = request["texts"]
             tier = request.get("tier", "")
+
+            # Single-text fast lane (issue #577): hook recall queries must
+            # never queue behind batch ingestion work or OOM recovery.
+            if len(texts) <= self._FAST_LANE_MAX_TEXTS:
+                fast = self._handle_fast_embed(texts, tier)
+                if fast is not None:
+                    return fast
 
             now = time.time()
             with self._lock:
@@ -250,25 +450,34 @@ class ModelServer:
                 self._throttler.before_batch()
 
             encode_start = time.time()
+            # `vectors` is assigned on exactly one of two paths: inside the
+            # locked try (retry_on_cpu stays False), or by the post-lock
+            # retry (retry_on_cpu True). Any other outcome raises.
+            vectors = None
+            retry_on_cpu = False
             with self._lock:
                 model = self._get_embed_model(tier)
                 try:
                     vectors = model.encode(texts, show_progress_bar=False)
                 except RuntimeError as exc:
-                    from truememory.mps_utils import is_mps_oom, flush_mps_cache
+                    from truememory.mps_utils import is_mps_oom
                     if not is_mps_oom(exc):
                         raise
-                    log.warning("MPS OOM during encoding — flushing cache and retrying on CPU")
-                    flush_mps_cache()
-                    if hasattr(model, "to"):
-                        model.to("cpu")
-                    vectors = model.encode(texts, show_progress_bar=False)
-                    try:
-                        import torch
-                        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                            model.to("mps")
-                    except Exception:
-                        pass
+                    # Issue #577: sticky-CPU degradation via the single
+                    # shared recovery path, atomic in this lock hold. The
+                    # model is never re-promoted to MPS (the old re-promotion
+                    # left the MPS pool above its watermark cap and
+                    # guaranteed the next OOM — retry storms). Only the
+                    # expensive full re-encode runs OUTSIDE the lock, so
+                    # other clients are not starved for 23-112s.
+                    self._recover_embed_oom_locked(model)
+                    retry_on_cpu = True
+            if retry_on_cpu:
+                log.warning(
+                    "MPS OOM during encoding — retrying on CPU outside the "
+                    "request lock"
+                )
+                vectors = model.encode(texts, show_progress_bar=False)
             encode_time = time.time() - encode_start
 
             if self._throttler_active and self._throttler:
@@ -286,8 +495,33 @@ class ModelServer:
         if op == "rerank":
             pairs = request["pairs"]
             model_name = request.get("model_name")
+            oom = False
             with self._lock:
                 reranker = self._get_reranker(model_name)
+                try:
+                    scores = reranker.predict(
+                        pairs, batch_size=64, show_progress_bar=False
+                    )
+                except RuntimeError as exc:
+                    from truememory.mps_utils import is_mps_oom, flush_mps_cache
+                    if not is_mps_oom(exc):
+                        raise
+                    # Issue #577: the rerank path previously had NO OOM
+                    # handler — a raw MPS OOM reached the client (3/3 rerank
+                    # deaths in the baseline probe). Same sticky-CPU policy
+                    # as embed: drop the MPS-loaded model and reload on CPU.
+                    # Mark + reload happen ATOMICALLY under this same lock
+                    # hold so the retry below always runs on the locally
+                    # reloaded CPU instance (panel round 1, item 1).
+                    self._mark_sticky_cpu("rerank")
+                    flush_mps_cache()
+                    self._reranker = None
+                    self._reranker_name = None
+                    reranker = self._get_reranker(model_name)  # sticky → CPU
+                    oom = True
+            if oom:
+                # Retry outside the lock — rerank batches are the expensive
+                # part; other clients must not starve behind the recovery.
                 scores = reranker.predict(
                     pairs, batch_size=64, show_progress_bar=False
                 )
@@ -302,13 +536,21 @@ class ModelServer:
         except ImportError:
             log.warning("Cannot import DynamicThrottler — running without throttling")
             return
-        device = "cpu"
-        try:
-            import torch
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-        except ImportError:
-            pass
+        # Issue #577: honor sticky-CPU degradation and TRUEMEMORY_DEVICE in
+        # the throttler's device pick (it tunes MPS-specific behavior).
+        if "embed" in self._sticky_cpu:
+            device = "cpu"
+        else:
+            from truememory.mps_utils import resolve_device
+            device = resolve_device(None)
+            if device is None:
+                device = "cpu"
+                try:
+                    import torch
+                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        device = "mps"
+                except ImportError:
+                    pass
         self._throttler = DynamicThrottler(device=device)
         self._throttler_active = True
         log.info(
@@ -406,7 +648,7 @@ class ModelServer:
             time.sleep(60)
             if not self._running:
                 break
-            with self._lock:
+            with self._activity_lock:
                 last = self._last_activity
             elapsed = time.time() - last
             if elapsed >= IDLE_TIMEOUT:
@@ -517,8 +759,13 @@ class ModelServer:
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
-        self._embed_model = None
+        # Reset the embed snapshot and fast-lane identity so no stale model
+        # identity survives a stop (issue #577, panel round 2).
+        self._embed_state = None
         self._reranker = None
+        self._reranker_name = None
+        self._fast_encoder = None
+        self._fast_model_id = None
         self._token = None
         gc.collect()
         log.info("Model server stopped")

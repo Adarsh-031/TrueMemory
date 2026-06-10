@@ -466,6 +466,18 @@ def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> s
     except ImportError:
         return ""
 
+    # Issue #577: arm a short per-request deadline for every model-server
+    # call this hook makes. Under server contention (batch ingestion / MPS
+    # OOM recovery) embeds previously stalled up to 120s each (5 serial
+    # searches = 10 min worst case); with the deadline they fast-fail and
+    # engine.search falls back to FTS-only retrieval.
+    try:
+        from truememory.ingest.hooks._shared import get_recall_deadline
+        from truememory.model_client import set_request_timeout
+        set_request_timeout(get_recall_deadline())
+    except Exception:
+        pass
+
     db = db_path or None
     memory = Memory(path=db) if db else Memory()
 

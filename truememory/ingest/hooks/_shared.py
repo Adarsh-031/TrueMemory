@@ -35,6 +35,28 @@ except ValueError:
     _RECALL_DEBOUNCE_SECONDS = 60.0
 
 
+def get_recall_deadline() -> float | None:
+    """Per-request model-server deadline for hook recall searches (#577).
+
+    Hooks block on the shared model server; under contention (batch
+    ingestion, MPS OOM recovery) a single embed could previously stall for
+    the full 120s client timeout. Recall paths arm this short deadline via
+    ``model_client.set_request_timeout`` so embeds fast-fail and the
+    engine's FTS-only fallback actually triggers.
+
+    Configured by ``TRUEMEMORY_HOOK_RECALL_TIMEOUT`` (seconds, default 5).
+    ``0`` or negative disables the deadline (legacy 120s behavior); a
+    malformed value falls back to the default instead of crashing the hook.
+    """
+    try:
+        deadline = float(os.environ.get("TRUEMEMORY_HOOK_RECALL_TIMEOUT", "5"))
+    except ValueError:
+        return 5.0
+    if deadline <= 0:
+        return None
+    return deadline
+
+
 def _safe_session_id(session_id: str) -> str:
     """Sanitize session_id to prevent path traversal."""
     return "".join(c for c in session_id if c.isalnum() or c in "-_")[:64]
