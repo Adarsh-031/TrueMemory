@@ -197,6 +197,7 @@ m = Memory()
 
 m.add("Prefers dark mode and TypeScript", user_id="alex")
 m.add("Works at Anthropic as a senior engineer", user_id="alex")
+m.add("Always sign commits with GPG", directive=True)  # directives auto-load every session
 
 results = m.search("What are Alex's preferences?", user_id="alex")
 results = m.search_deep("career history?", user_id="alex")  # multi-round, higher accuracy
@@ -204,7 +205,7 @@ results = m.search_deep("career history?", user_id="alex")  # multi-round, highe
 
 | Method | Description |
 |--------|-------------|
-| `m.add(content, user_id)` | Store a memory |
+| `m.add(content, user_id)` | Store a memory (`directive=True` for standing instructions that auto-load at the start of every session) |
 | `m.search(query, user_id)` | Search (6-layer pipeline + reranker) |
 | `m.search_deep(query, user_id)` | Multi-round agentic search |
 | `m.get(id)` / `m.get_all(user_id)` | Retrieve memories |

@@ -56,6 +56,8 @@ When the `truememory` MCP server is connected, follow these rules:
 ## Auto-Recall (every session)
 - At the START of each conversation, call `truememory_search` with a \
 broad query about the user to load relevant memories before responding.
+- Directives are automatically injected at session start -- you do not \
+need to search for them.
 - Before making recommendations, check TrueMemory for stored preferences.
 - When the user asks anything about past conversations or personal \
 facts -- search TrueMemory first.
@@ -65,6 +67,10 @@ facts -- search TrueMemory first.
 via `truememory_store`. Do not ask permission.
 - When an important decision is made, store it.
 - When the user corrects you, store the correction.
+- When the user gives a standing instruction ("always do X", \
+"never do Y", "from now on..."), store it as a directive: \
+`truememory_store(content="...", directive=True)`. Directives \
+auto-load at the start of every session -- regular memories do not.
 - Write each memory as a clear, atomic statement.
 - Do NOT store full conversations, large code blocks, or transient \
 debugging context.

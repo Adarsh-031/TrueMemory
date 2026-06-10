@@ -66,6 +66,24 @@ class CLIAdapter(ABC):
         """Return the TrueMemory system prompt content for this CLI."""
 
 
+# Served when CLAUDE_TEMPLATE.md is missing or unreadable. Must carry the
+# same directive guidance as the template (issue #589, D-7) so directives
+# stay discoverable even on broken installs.
+_FALLBACK_PROMPT = (
+    "# TrueMemory — Persistent Memory\n\n"
+    "You have access to TrueMemory MCP tools for persistent memory.\n"
+    "- Use `truememory_store` to save user facts, preferences, and decisions.\n"
+    '- When the user gives a standing instruction ("always do X", "never do Y", '
+    '"from now on..."), store it as a directive: '
+    '`truememory_store(content="...", directive=True)`. Directives auto-load '
+    "at the start of every session — regular memories do not.\n"
+    "- Use `truememory_search` to recall stored memories before answering.\n"
+    "- Directives are injected automatically at session start — you do not "
+    "need to search for them.\n"
+    "- Search TrueMemory FIRST on any 'do you remember' question.\n"
+)
+
+
 def get_generic_system_prompt() -> str:
     """Return the TrueMemory system prompt for non-Claude CLIs."""
     template = Path(__file__).parent.parent.parent / "ingest" / "CLAUDE_TEMPLATE.md"
@@ -77,10 +95,4 @@ def get_generic_system_prompt() -> str:
             return content
         except OSError:
             pass
-    return (
-        "# TrueMemory — Persistent Memory\n\n"
-        "You have access to TrueMemory MCP tools for persistent memory.\n"
-        "- Use `truememory_store` to save user facts, preferences, and decisions.\n"
-        "- Use `truememory_search` to recall stored memories before answering.\n"
-        "- Search TrueMemory FIRST on any 'do you remember' question.\n"
-    )
+    return _FALLBACK_PROMPT

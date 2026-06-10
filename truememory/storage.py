@@ -197,6 +197,10 @@ CREATE INDEX IF NOT EXISTS idx_summaries_entity ON summaries(entity);
 CREATE INDEX IF NOT EXISTS idx_summaries_period ON summaries(period);
 CREATE INDEX IF NOT EXISTS idx_entity_relationships_a ON entity_relationships(entity_a);
 CREATE INDEX IF NOT EXISTS idx_landmark_events_timestamp ON landmark_events(timestamp);
+-- NOTE: idx_messages_directive is intentionally NOT in this script. It is
+-- created by create_db() behind a column-existence check so that opening a
+-- legacy (pre-directive) DB whose migration could not run never raises
+-- "no such column: directive" (issue #589, D-2).
 
 -- Vector cache registry (tier-switch: tracks per-tier-group vector table state)
 CREATE TABLE IF NOT EXISTS vector_cache_registry (
@@ -292,7 +296,10 @@ def _migrate_messages_schema(conn: sqlite3.Connection, db_path: str | Path) -> N
 
     Safety measures:
     - Creates a complete backup (DB + WAL + SHM) before any changes
-    - If backup fails, migration is skipped entirely
+    - If the backup fails, the migration still proceeds (with a loud
+      warning): the ALTER TABLE ADD COLUMN statements are additive and
+      transactional, while skipping the migration would leave the DB
+      unusable by current code (issue #589, D-2)
     - All ALTER TABLE statements run inside a single transaction
     - If any ALTER fails, the entire transaction is rolled back
     - Only runs if the messages table already exists and is missing columns
@@ -311,8 +318,21 @@ def _migrate_messages_schema(conn: sqlite3.Connection, db_path: str | Path) -> N
     if str(db_path) != ":memory:":
         backup = _backup_database(Path(str(db_path)))
         if backup is None:
-            log.warning("Skipping legacy migration — backup failed")
-            return
+            # Do NOT skip the migration: an unmigrated DB is unusable by
+            # current code (missing columns break every insert/select), and
+            # with the directive index it used to hard-crash at open
+            # (issue #589, D-2). The ALTERs below are additive and run in a
+            # single rolled-back-on-failure transaction, so proceeding
+            # without a backup is the lower-risk path.
+            log.warning(
+                "Pre-migration backup FAILED for %s — proceeding with the "
+                "legacy schema migration anyway (columns to add: %s). The "
+                "migration is additive and transactional, but no restore "
+                "point exists for this upgrade; back up the database file "
+                "manually if you need one.",
+                db_path,
+                ", ".join(sorted(missing)),
+            )
 
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -356,6 +376,27 @@ def create_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA mmap_size=268435456")
     _migrate_messages_schema(conn, db_path)
     conn.executescript(_SCHEMA_SQL)
+    # The directive index lives outside _SCHEMA_SQL on purpose: if a legacy
+    # DB's migration could not add messages.directive (e.g. a rolled-back
+    # ALTER), an unconditional CREATE INDEX inside executescript would turn a
+    # degraded-but-openable DB into a hard crash at open with
+    # "no such column: directive" (issue #589, D-2). Open must never raise
+    # for a missing directive column.
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "directive" in cols:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_directive ON messages(directive)"
+            )
+        else:
+            log.warning(
+                "messages.directive column is missing after migration — "
+                "directive index not created; database %s is open in "
+                "degraded legacy mode",
+                db_path,
+            )
+    except sqlite3.OperationalError:
+        log.warning("Could not ensure directive index on %s", db_path, exc_info=True)
     conn.commit()
     return conn
 
@@ -642,17 +683,21 @@ def delete_message(conn: sqlite3.Connection, msg_id: int) -> bool:
     """
     # Delete child rows BEFORE the parent to avoid FK violations on
     # databases created before ON DELETE CASCADE was added to the schema.
-    for tbl in (
-        "vec_messages", "vec_messages_edge", "vec_messages_basepro",
-    ):
-        try:
-            conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
-    for tbl in (
-        "vec_messages_sep", "vec_messages_sep_edge",
-        "vec_messages_sep_basepro",
-    ):
+    #
+    # The vector tables are derived from the tier groups instead of being
+    # hardcoded: the old explicit list missed the `custom` tier group, which
+    # orphaned embeddings in vec_messages_custom / vec_messages_sep_custom on
+    # delete (issue #589, D-6). Tables that don't exist on a given install
+    # are skipped via the OperationalError guard.
+    from truememory.tier_config import VALID_TIER_GROUPS
+
+    vec_tables = ["vec_messages"] + [
+        f"vec_messages_{group}" for group in sorted(VALID_TIER_GROUPS)
+    ]
+    sep_tables = ["vec_messages_sep"] + [
+        f"vec_messages_sep_{group}" for group in sorted(VALID_TIER_GROUPS)
+    ]
+    for tbl in (*vec_tables, *sep_tables):
         try:
             conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
         except sqlite3.OperationalError:
@@ -700,7 +745,7 @@ def update_message(conn: sqlite3.Connection, msg_id: int, **fields) -> bool:
     Returns:
         True if the row was updated, False if ID not found.
     """
-    allowed = {"content", "sender", "recipient", "timestamp", "category", "modality"}
+    allowed = {"content", "sender", "recipient", "timestamp", "category", "modality", "directive"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False

@@ -36,6 +36,9 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 MEMORY_LIMIT = int(os.environ.get("TRUEMEMORY_RECALL_LIMIT", "25"))
+# Max directives force-injected at session start. Uncapped injection let a
+# large directive set consume unbounded context (issue #589, D-4).
+DIRECTIVE_LIMIT = int(os.environ.get("TRUEMEMORY_DIRECTIVE_LIMIT", "50"))
 ONBOARDED_MARKER = Path.home() / ".truememory" / ".onboarded"
 BACKLOG_DIR = Path.home() / ".truememory" / "backlog"
 _DRAIN_CAP = 3
@@ -443,19 +446,57 @@ def _first_run_context() -> str:
     return "\n".join(lines)
 
 
+def _directive_scope_sql(user_id: str) -> tuple[str, list]:
+    """WHERE-clause suffix + params for directive queries.
+
+    Directives stored without a sender (``truememory_store`` defaults
+    ``user_id=''``) must stay visible under ``--user`` scoping — they used to
+    be silently hidden (issue #589, D-4).
+    """
+    if user_id:
+        return " AND (sender = ? OR sender = '')", [user_id]
+    return "", []
+
+
+def _count_directives(memory, user_id: str = "") -> int:
+    """Total stored directives in scope (cheap COUNT on idx_messages_directive)."""
+    try:
+        scope_sql, params = _directive_scope_sql(user_id)
+        row = memory._engine.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE directive = 1" + scope_sql, params
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        log.warning("Failed to count directives", exc_info=True)
+        return 0
+
+
 def _load_directives(memory, user_id: str = "") -> list[dict]:
-    """Load all directive memories unconditionally."""
+    """Load directive memories for session injection, capped at DIRECTIVE_LIMIT.
+
+    Failures are logged (not swallowed): a directive-column error on a
+    half-migrated DB must not silently disable the feature (issue #589, D-4).
+    """
     try:
         memory._engine._ensure_connection()
         query = "SELECT id, content, sender, timestamp, category FROM messages WHERE directive = 1"
-        params: list = []
-        if user_id:
-            query += " AND sender = ?"
-            params.append(user_id)
-        query += " ORDER BY id"
+        scope_sql, params = _directive_scope_sql(user_id)
+        query += scope_sql
+        # LIMIT cap+1 so truncation is detectable without an unbounded fetch.
+        query += " ORDER BY id LIMIT ?"
+        params.append(DIRECTIVE_LIMIT + 1)
         rows = memory._engine.conn.execute(query, params).fetchall()
+        if len(rows) > DIRECTIVE_LIMIT:
+            log.warning(
+                "Directive injection capped at %d (more are stored). Prune "
+                "stale directives with truememory_forget, or raise "
+                "TRUEMEMORY_DIRECTIVE_LIMIT.",
+                DIRECTIVE_LIMIT,
+            )
+            rows = rows[:DIRECTIVE_LIMIT]
         return [{"id": r[0], "content": r[1], "sender": r[2]} for r in rows]
     except Exception:
+        log.warning("Failed to load directives for session injection", exc_info=True)
         return []
 
 
@@ -498,6 +539,14 @@ def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> s
             content = d.get("content", "").strip()
             if content:
                 dir_lines.append(f"- {content}")
+        if len(directives) >= DIRECTIVE_LIMIT:
+            total = _count_directives(memory, user_id=user_id)
+            if total > len(directives):
+                dir_lines.append(
+                    f"({len(directives)} of {total} directives shown — use "
+                    "truememory_directives to view all, truememory_forget to "
+                    "prune stale ones)"
+                )
         dir_lines.append("</truememory-directives>")
         parts.append("\n".join(dir_lines))
 

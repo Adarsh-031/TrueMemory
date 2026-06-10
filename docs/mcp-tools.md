@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-TrueMemory exposes 8 tools via the Model Context Protocol. These are called by Claude Code, Claude Desktop, and other MCP-compatible clients.
+TrueMemory exposes 9 tools via the Model Context Protocol. These are called by Claude Code, Claude Desktop, and other MCP-compatible clients.
 
 ---
 
@@ -13,8 +13,23 @@ Store a memory. Claude calls this proactively when the user shares preferences, 
 | `content` | `str` | required | The fact to remember. One clear, atomic statement. |
 | `user_id` | `str` | `""` | Owner of this memory (e.g., a person's name). |
 | `metadata` | `str` | `""` | Optional JSON string of metadata. |
+| `directive` | `bool` | `false` | Set `true` for standing instructions ("always do X", "never do Y", "from now on..."). Directives are injected automatically at the start of every session — regular memories are not. |
 
 **Content limit:** 50,000 characters max.
+
+**Directives:** store a standing instruction with `directive=true`, list active ones with `truememory_directives`, and remove stale or contradicting ones with `truememory_forget`. Session-start injection is capped at 50 directives (override with `TRUEMEMORY_DIRECTIVE_LIMIT`).
+
+---
+
+## truememory_directives
+
+List all active directives — the always-loaded standing instructions that are injected at session start before search-ranked memories.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `user_id` | `str` | `""` | Filter to this user's directives (optional). |
+
+**Returns:** `{"directives": [...], "count": N}` with `id`, `content`, `user_id`, `created_at`, and `category` per directive. Delete a directive by ID with `truememory_forget`.
 
 ---
 
