@@ -50,6 +50,21 @@ RETENTION_DAYS = int(os.environ.get("TRUEMEMORY_BUFFER_RETENTION_DAYS", "7"))
 MAX_BUFFER_SIZE = int(os.environ.get("TRUEMEMORY_BUFFER_MAX_BYTES", str(10 * 1024 * 1024)))
 
 
+def _word_overlap(a: str, b: str) -> float:
+    """Scale-free Jaccard similarity on word sets (issue #632).
+
+    Used as the novelty fallback when retrieval scores are relative/fused
+    (FTS-only / degraded embedder) rather than absolute cosine similarity,
+    so the 0.85 cutoff cannot be trusted as a true cosine value.
+    """
+    words_a = set(re.findall(r"\w+", a.lower()))
+    words_b = set(re.findall(r"\w+", b.lower()))
+    union = words_a | words_b
+    if not union:
+        return 0.0
+    return len(words_a & words_b) / len(union)
+
+
 def _parse_args() -> argparse.Namespace:
     """Parse command-line overrides the installer threads through.
 
@@ -281,13 +296,32 @@ def _try_per_exchange_store(prompt: str, session_id: str, user_id: str, db_path:
     try:
         from truememory.client import Memory
         with Memory(path=db_path or None) as m:
-            # Novelty check: quick search to avoid dupes
+            # Novelty check: quick search to avoid dupes.
+            # Score-space contract (issue #632): a score is only a true
+            # absolute cosine similarity when its result is tagged
+            # score_space="cosine". The full search() pipeline can return
+            # RELATIVELY normalized scores (FTS top hit pinned to 1.0;
+            # reranker fused scores min-max pinned) — comparing those to the
+            # absolute 0.85 cutoff drops any prompt sharing one keyword with
+            # a stored memory as a bogus "duplicate", exactly when the
+            # embedder is dead.
+            #
+            # Apply the 0.85 cosine cutoff ONLY to cosine-space scores.
+            # Missing tag defaults to cosine for back-compat (matches
+            # dedup.py): raw vector hits and callers that predate the tag
+            # are genuine cosine. When the tag is explicitly "relative" the
+            # number is untrustworthy, so fall back to the scale-free
+            # word-overlap heuristic instead. (#631 makes the vector path
+            # emit true cosine, so this stays correct as it lands.)
             existing = m.search(prompt, user_id=user_id or None, limit=3)
             if existing:
                 for r in existing:
                     score = r.get("score", 0.0)
-                    if score > 0.85:
-                        return  # Too similar to existing memory
+                    if r.get("score_space", "cosine") != "relative":
+                        if score > 0.85:
+                            return  # Too similar to existing memory (cosine)
+                    elif _word_overlap(prompt, r.get("content", "")) > 0.85:
+                        return  # Scale-free near-duplicate (relative score)
 
             # Run through encoding gate
             from truememory.ingest.encoding_gate import EncodingGate
