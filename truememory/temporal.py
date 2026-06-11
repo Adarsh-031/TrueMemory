@@ -27,7 +27,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 
-from truememory.storage import _row_to_dict, _SELECT_COLS
+from truememory.storage import _row_to_dict, select_message_cols
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +650,7 @@ def get_timeline(
         clauses.append("(directive = 0 OR directive IS NULL)")
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = f"SELECT {_SELECT_COLS} FROM messages{where} ORDER BY timestamp"
+    sql = f"SELECT {select_message_cols(conn)} FROM messages{where} ORDER BY timestamp"
 
     rows = conn.execute(sql, params).fetchall()
     return [_row_to_dict(r) for r in rows]

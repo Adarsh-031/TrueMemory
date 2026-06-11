@@ -17,6 +17,12 @@ Key design decisions:
 
 import sqlite3
 
+from truememory.storage import (
+    _deserialize_metadata,
+    directive_filter_sql,
+    select_message_cols,
+)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -79,21 +85,21 @@ def _rows_to_results(rows: list[tuple]) -> list[dict]:
             "category": row[5],
             "modality": row[6],
             "directive": bool(row[7]),
-            "raw_score": row[8],
+            "metadata": _deserialize_metadata(row[8]),
+            "raw_score": row[9],
             "score": 0.0,  # placeholder, filled by _normalize_scores
         }
         for row in rows
     ]
 
 
-_FTS_SELECT = """
-    SELECT
-        m.id, m.content, m.sender, m.recipient, m.timestamp,
-        m.category, m.modality, m.directive,
-        messages_fts.rank AS bm25_score
-    FROM messages_fts
-    JOIN messages m ON m.id = messages_fts.rowid
-"""
+def _fts_select(conn: sqlite3.Connection) -> str:
+    return (
+        f"SELECT {select_message_cols(conn, alias='m')}, "
+        "messages_fts.rank AS bm25_score "
+        "FROM messages_fts "
+        "JOIN messages m ON m.id = messages_fts.rowid"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +134,8 @@ def search_fts(
     if not query or not query.strip():
         return []
 
-    directive_filter = "" if include_directives else " AND (m.directive = 0 OR m.directive IS NULL)"
-    sql = f"{_FTS_SELECT} WHERE messages_fts MATCH ?{directive_filter} ORDER BY messages_fts.rank LIMIT ?"
+    directive_filter = directive_filter_sql(conn, alias="m", include_directives=include_directives)
+    sql = f"{_fts_select(conn)} WHERE messages_fts MATCH ?{directive_filter} ORDER BY messages_fts.rank LIMIT ?"
     safe = _build_safe_query(query)
     if not safe:
         return []
@@ -169,9 +175,9 @@ def search_fts_by_sender(
     if not query or not query.strip():
         return []
 
-    directive_filter = "" if include_directives else " AND (m.directive = 0 OR m.directive IS NULL)"
+    directive_filter = directive_filter_sql(conn, alias="m", include_directives=include_directives)
     sql = (
-        f"{_FTS_SELECT}"
+        f"{_fts_select(conn)}"
         f" WHERE messages_fts MATCH ? AND m.sender = ?{directive_filter}"
         " ORDER BY messages_fts.rank LIMIT ?"
     )
@@ -224,9 +230,9 @@ def search_fts_in_range(
     # enough results.
     candidate_limit = min(max(limit * 10, 100), 1000)
 
-    directive_filter = "" if include_directives else " AND (m.directive = 0 OR m.directive IS NULL)"
+    directive_filter = directive_filter_sql(conn, alias="m", include_directives=include_directives)
     sql = (
-        f"{_FTS_SELECT}"
+        f"{_fts_select(conn)}"
         f" WHERE messages_fts MATCH ?{directive_filter}"
         " ORDER BY messages_fts.rank LIMIT ?"
     )
@@ -267,12 +273,9 @@ def _fts_search(conn: sqlite3.Connection, fts_query: str,
                 limit: int = 20,
                 include_directives: bool = False) -> list[dict]:
     """Run an FTS5 search and return result dicts."""
-    directive_filter = "" if include_directives else " AND (m.directive = 0 OR m.directive IS NULL)"
+    directive_filter = directive_filter_sql(conn, alias="m", include_directives=include_directives)
     sql = (
-        "SELECT m.id, m.content, m.sender, m.recipient, m.timestamp, "
-        "       m.category, m.modality, messages_fts.rank AS score "
-        "FROM messages_fts "
-        "JOIN messages m ON m.id = messages_fts.rowid "
+        f"{_fts_select(conn)} "
         f"WHERE messages_fts MATCH ?{directive_filter} "
         "ORDER BY messages_fts.rank LIMIT ?"
     )
@@ -285,7 +288,8 @@ def _fts_search(conn: sqlite3.Connection, fts_query: str,
         {
             "id": r[0], "content": r[1], "sender": r[2],
             "recipient": r[3], "timestamp": r[4],
-            "category": r[5], "modality": r[6], "score": r[7],
+            "category": r[5], "modality": r[6], "directive": bool(r[7]),
+            "metadata": _deserialize_metadata(r[8]), "score": r[9],
         }
         for r in rows
     ]

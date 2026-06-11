@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS messages (
     episode_id INTEGER DEFAULT NULL,
     emotional_valence REAL DEFAULT 0.0,
     embedding_separation BLOB DEFAULT NULL,
-    directive INTEGER DEFAULT 0
+    directive INTEGER DEFAULT 0,
+    metadata TEXT DEFAULT '{}'
 );
 
 -- FTS5 virtual table for full-text search
@@ -262,6 +263,7 @@ _EXPECTED_COLUMNS = {
     "emotional_valence": "REAL DEFAULT 0.0",
     "embedding_separation": "BLOB DEFAULT NULL",
     "directive": "INTEGER DEFAULT 0",
+    "metadata": "TEXT DEFAULT '{}'",
 }
 
 
@@ -427,7 +429,7 @@ def bulk_replace_messages(conn: sqlite3.Connection, messages: list[dict]) -> int
 
     Each dict in *messages* should have at minimum a ``content`` key.
     Optional keys: ``sender``, ``recipient``, ``timestamp``, ``category``,
-    ``modality``.
+    ``modality``, ``metadata``.
 
     Args:
         conn:     Open database connection (from :func:`create_db`).
@@ -454,8 +456,8 @@ def bulk_replace_messages(conn: sqlite3.Connection, messages: list[dict]) -> int
 
     conn.executemany(
         """INSERT INTO messages
-           (content, sender, recipient, timestamp, category, modality, directive)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (content, sender, recipient, timestamp, category, modality, directive, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 msg["content"],
@@ -465,6 +467,7 @@ def bulk_replace_messages(conn: sqlite3.Connection, messages: list[dict]) -> int
                 msg.get("category", ""),
                 msg.get("modality", ""),
                 1 if msg.get("directive") else 0,
+                _serialize_metadata(msg.get("metadata")),
             )
             for msg in messages
         ],
@@ -524,6 +527,33 @@ def load_messages_from_file(conn: sqlite3.Connection, json_path: str | Path) -> 
 # Message retrieval (CRUD reads)
 # ---------------------------------------------------------------------------
 
+def _serialize_metadata(metadata: dict | None) -> str:
+    """Serialize user metadata for the messages.metadata JSON column."""
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise TypeError(f"metadata must be a dict or None, got {type(metadata).__name__}")
+    try:
+        return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    except TypeError as exc:
+        raise TypeError("metadata must be JSON-serializable") from exc
+
+
+def _deserialize_metadata(raw: object) -> dict:
+    """Parse messages.metadata, degrading corrupt legacy values to {}."""
+    if raw in (None, ""):
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _row_to_dict(row: tuple) -> dict:
     """Convert a raw row tuple to a message dict."""
     d = {
@@ -537,10 +567,64 @@ def _row_to_dict(row: tuple) -> dict:
     }
     if len(row) > 7:
         d["directive"] = bool(row[7])
+    if len(row) > 8:
+        d["metadata"] = _deserialize_metadata(row[8])
+    else:
+        d["metadata"] = {}
     return d
 
 
-_SELECT_COLS = "id, content, sender, recipient, timestamp, category, modality, directive"
+_SELECT_COLS = "id, content, sender, recipient, timestamp, category, modality, directive, metadata"
+_OPTIONAL_SELECT_DEFAULTS = {
+    "sender": "''",
+    "recipient": "''",
+    "timestamp": "''",
+    "category": "''",
+    "modality": "''",
+    "directive": "0",
+    "metadata": "'{}'",
+}
+
+
+def _message_columns(conn: sqlite3.Connection) -> set[str]:
+    """Return column names for messages, or an empty set on bad schemas."""
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def select_message_cols(conn: sqlite3.Connection, alias: str = "") -> str:
+    """Build the stable message SELECT list, defaulting missing optional columns.
+
+    Some tests and old user databases create a minimal ``messages`` table by
+    hand. Query code should still return the same dict shape rather than
+    failing on newly-added optional columns such as ``metadata``.
+    """
+    existing = _message_columns(conn)
+    prefix = f"{alias}." if alias else ""
+    cols = []
+    for name in (
+        "id", "content", "sender", "recipient", "timestamp",
+        "category", "modality", "directive", "metadata",
+    ):
+        if name in existing or name not in _OPTIONAL_SELECT_DEFAULTS:
+            cols.append(f"{prefix}{name}")
+        else:
+            cols.append(f"{_OPTIONAL_SELECT_DEFAULTS[name]} AS {name}")
+    return ", ".join(cols)
+
+
+def directive_filter_sql(
+    conn: sqlite3.Connection,
+    alias: str = "",
+    include_directives: bool = False,
+) -> str:
+    """Return a WHERE fragment that excludes directives when possible."""
+    if include_directives or "directive" not in _message_columns(conn):
+        return ""
+    prefix = f"{alias}." if alias else ""
+    return f" AND ({prefix}directive = 0 OR {prefix}directive IS NULL)"
 
 
 def get_message(conn: sqlite3.Connection, msg_id: int) -> dict | None:
@@ -555,7 +639,7 @@ def get_message(conn: sqlite3.Connection, msg_id: int) -> dict | None:
         Message dict, or ``None`` if not found.
     """
     row = conn.execute(
-        f"SELECT {_SELECT_COLS} FROM messages WHERE id = ?", (msg_id,)
+        f"SELECT {select_message_cols(conn)} FROM messages WHERE id = ?", (msg_id,)
     ).fetchone()
     return _row_to_dict(row) if row else None
 
@@ -572,7 +656,7 @@ def get_messages_by_sender(conn: sqlite3.Connection, sender: str) -> list[dict]:
         List of message dicts.
     """
     rows = conn.execute(
-        f"SELECT {_SELECT_COLS} FROM messages WHERE sender = ? ORDER BY timestamp",
+        f"SELECT {select_message_cols(conn)} FROM messages WHERE sender = ? ORDER BY timestamp",
         (sender,),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
@@ -609,7 +693,7 @@ def get_messages_in_range(
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = conn.execute(
-        f"SELECT {_SELECT_COLS} FROM messages{where} ORDER BY timestamp",
+        f"SELECT {select_message_cols(conn)} FROM messages{where} ORDER BY timestamp",
         params,
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
@@ -652,7 +736,7 @@ def insert_message(conn: sqlite3.Connection, msg: dict) -> int:
         conn: Open database connection (from :func:`create_db`).
         msg:  Message dict.  Must have ``content``; optional keys:
               ``sender``, ``recipient``, ``timestamp``, ``category``,
-              ``modality``.
+              ``modality``, ``metadata``.
 
     Returns:
         The new row's integer ID.
@@ -662,8 +746,8 @@ def insert_message(conn: sqlite3.Connection, msg: dict) -> int:
         raise ValueError("content cannot be empty or whitespace-only")
     cursor = conn.execute(
         """INSERT INTO messages
-           (content, sender, recipient, timestamp, category, modality, directive)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (content, sender, recipient, timestamp, category, modality, directive, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             msg["content"],
             msg.get("sender", ""),
@@ -672,6 +756,7 @@ def insert_message(conn: sqlite3.Connection, msg: dict) -> int:
             msg.get("category", ""),
             msg.get("modality", ""),
             1 if msg.get("directive") else 0,
+            _serialize_metadata(msg.get("metadata")),
         ),
     )
     return cursor.lastrowid
@@ -743,7 +828,7 @@ def update_message(conn: sqlite3.Connection, msg_id: int, **fields) -> bool:
 
     Only the provided keyword arguments are changed.  Valid field names:
     ``content``, ``sender``, ``recipient``, ``timestamp``, ``category``,
-    ``modality``.
+    ``modality``, ``metadata``.
 
     The AFTER UPDATE trigger on ``messages`` automatically keeps the
     FTS5 index in sync.
@@ -756,10 +841,12 @@ def update_message(conn: sqlite3.Connection, msg_id: int, **fields) -> bool:
     Returns:
         True if the row was updated, False if ID not found.
     """
-    allowed = {"content", "sender", "recipient", "timestamp", "category", "modality", "directive"}
+    allowed = {"content", "sender", "recipient", "timestamp", "category", "modality", "directive", "metadata"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
+    if "metadata" in updates:
+        updates["metadata"] = _serialize_metadata(updates["metadata"])
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [msg_id]
