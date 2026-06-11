@@ -60,6 +60,69 @@ _config_cache_time: float = 0.0
 # M7 (#504) — Serialize config writes from concurrent MCP handlers / tier-switch.
 _config_write_lock = threading.Lock()
 
+# M-58 (#641) — Cross-process advisory lock for config writes. _config_write_lock
+# above only serializes threads inside ONE process; a separate `truememory-mcp`,
+# CLI `truememory ingest --setup`, or tier-switch process can still interleave a
+# read-modify-write and clobber another writer's API key. The companion lockfile
+# (config.json.lock) is held with fcntl/msvcrt for the duration of each write.
+_CONFIG_LOCK_PATH = _TRUEMEMORY_DIR / "config.json.lock"
+
+
+class _config_file_lock:
+    """Context manager taking a cross-process exclusive lock on config writes.
+
+    Reuses the same fcntl/msvcrt pattern as
+    ``tier_switch.manager.run_rebuild_sync`` (#641). Best-effort: if the lock
+    cannot be acquired (e.g. a filesystem without flock support) we proceed
+    anyway rather than fail the write — the in-process ``_config_write_lock``
+    plus the atomic ``os.replace`` still bound the damage. Held in BLOCKING mode
+    (LK_LOCK / LOCK_EX) so concurrent writers serialize instead of failing.
+    """
+
+    def __init__(self) -> None:
+        self._fd = None
+
+    def __enter__(self):
+        try:
+            _CONFIG_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = open(_CONFIG_LOCK_PATH, "w")
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._fd.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except OSError:
+            # Could not open or lock — proceed unlocked (best effort).
+            if self._fd is not None:
+                try:
+                    self._fd.close()
+                except OSError:
+                    pass
+                self._fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is None:
+            return False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(self._fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            try:
+                self._fd.close()
+            except OSError:
+                pass
+            self._fd = None
+        return False
+
 
 class _ConfigShapeError(ValueError):
     """Config parsed as valid JSON but the top-level value is not an object
@@ -154,6 +217,31 @@ def _load_config() -> dict:
         return {}
 
 
+def _replace_with_retry(
+    src: str, dst: str, *, attempts: int = 10, delay: float = 0.03,
+) -> None:
+    """``os.replace`` that tolerates Windows replace-while-open semantics (#641).
+
+    POSIX lets you rename a temp file over a path that another process has open;
+    the first attempt succeeds and we return immediately. Windows raises
+    ``PermissionError(13)`` (sharing violation) if the destination is currently
+    held open by any handle — and a lock-LESS reader (``_load_config`` just
+    opens + reads config.json without the cross-process write lock) can hold
+    that handle during our replace. So on ``PermissionError`` we retry with a
+    short backoff before giving up; the reader's handle is transient and closes
+    within a few milliseconds. The caller's ``except BaseException`` still
+    cleans up the temp file if every attempt fails.
+    """
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _save_config(config: dict) -> None:
     """Save config to ~/.truememory/config.json.
 
@@ -172,7 +260,9 @@ def _save_config(config: dict) -> None:
     global _config_cache, _config_cache_mtime, _config_cache_time
     import tempfile
 
-    with _config_write_lock:
+    # _config_file_lock (M-58 / #641) serializes writers ACROSS processes;
+    # _config_write_lock serializes threads WITHIN this process. Acquire both.
+    with _config_file_lock(), _config_write_lock:
         _TRUEMEMORY_DIR.mkdir(parents=True, exist_ok=True)
         _TRUEMEMORY_DIR.chmod(0o700)
 
@@ -185,7 +275,7 @@ def _save_config(config: dict) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
             os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, str(_CONFIG_PATH))
+            _replace_with_retry(tmp_path, str(_CONFIG_PATH))
         except BaseException:
             # Clean up the temp file on failure — original config survives
             try:
